@@ -1,0 +1,151 @@
+
+    
+import hashlib
+import json
+from datetime import datetime, timezone
+
+
+class StellarPulseEngine:
+    def __init__(self, network: str = "stellar-testnet", platform_fee_rate: float = 0.0):
+        self.network = network
+        # Zero-cost platform fee by default (only nominal network base fee tracked if needed)
+        self.platform_fee_rate = max(0.0, float(platform_fee_rate))
+        self.accounts: dict[str, dict] = {}
+        self.ledger: list[dict] = []
+
+    @staticmethod
+    def _hash_identity(identity_seed: str) -> str:
+        """Create a privacy-preserving commitment hash without storing raw sensitive IDs."""
+        normalized = str(identity_seed).strip().encode("utf-8")
+        return hashlib.sha256(normalized).hexdigest()
+
+    def verify_digital_identity(self, user_id: str, identity_secret: str) -> dict:
+        """Register or verify a user's zero-knowledge style identity commitment."""
+        uid = str(user_id).strip()
+        if not uid or not str(identity_secret).strip():
+            raise ValueError("User ID and identity credential are required.")
+
+        commitment = self._hash_identity(f"{uid}:{identity_secret}")
+        account = self.accounts.get(uid)
+
+        if not account:
+            account = {
+                "user_id": uid,
+                "identity_commitment": commitment,
+                "verified": True,
+                "wallet_balance": 0.0,
+                "micro_savings_balance": 0.0,
+                "created_at": datetime.now(timezone.utc).isoformat(),
+            }
+            self.accounts[uid] = account
+            status = "identity_verified_new_account"
+        else:
+            verified = account["identity_commitment"] == commitment
+            account["verified"] = verified
+            status = "identity_verified" if verified else "identity_mismatch"
+
+        return {"user_id": uid, "status": status, "verified": account["verified"]}
+
+    def deposit_with_auto_micro_savings(
+        self,
+        user_id: str,
+        amount: float,
+        auto_save_ratio: float = 0.10,
+    ) -> dict:
+        """Deposit funds and automatically allocate a percentage into micro-savings at zero fee."""
+        if user_id not in self.accounts or not self.accounts[user_id]["verified"]:
+            raise PermissionError(f"Account '{user_id}' is not verified.")
+        if amount <= 0:
+            raise ValueError("Deposit amount must be positive.")
+
+        ratio = max(0.0, min(1.0, float(auto_save_ratio)))
+        platform_fee = round(amount * self.platform_fee_rate, 6)
+        net_amount = round(amount - platform_fee, 6)
+        savings_portion = round(net_amount * ratio, 6)
+        spendable_portion = round(net_amount - savings_portion, 6)
+
+        acct = self.accounts[user_id]
+        acct["micro_savings_balance"] = round(acct["micro_savings_balance"] + savings_portion, 6)
+        acct["wallet_balance"] = round(acct["wallet_balance"] + spendable_portion, 6)
+
+        tx = {
+            "tx_id": f"sp_{len(self.ledger) + 1:04d}",
+            "type": "deposit_micro_save",
+            "network": self.network,
+            "user_id": user_id,
+            "gross_amount": amount,
+            "platform_fee": platform_fee,
+            "micro_saved": savings_portion,
+            "wallet_credited": spendable_portion,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.ledger.append(tx)
+        return tx
+
+    def send_cross_border_transfer(
+        self,
+        sender_id: str,
+        receiver_id: str,
+        amount: float,
+        corridor: str = "BD-GLOBAL",
+    ) -> dict:
+        """Execute a low/zero-fee cross-border transfer between verified accounts."""
+        if amount <= 0:
+            raise ValueError("Transfer amount must be greater than zero.")
+        if sender_id not in self.accounts or receiver_id not in self.accounts:
+            raise ValueError("Both sender and receiver accounts must exist.")
+        if not self.accounts[sender_id]["verified"] or not self.accounts[receiver_id]["verified"]:
+            raise PermissionError("Both accounts must be verified for transfers.")
+
+        sender = self.accounts[sender_id]
+        receiver = self.accounts[receiver_id]
+
+        fee = round(amount * self.platform_fee_rate, 6)
+        total_debit = round(amount + fee, 6)
+        if sender["wallet_balance"] < total_debit:
+            raise ValueError("Insufficient wallet balance for transfer.")
+
+        sender["wallet_balance"] = round(sender["wallet_balance"] - total_debit, 6)
+        receiver["wallet_balance"] = round(receiver["wallet_balance"] + amount, 6)
+
+        tx = {
+            "tx_id": f"sp_{len(self.ledger) + 1:04d}",
+            "type": "cross_border_transfer",
+            "network": self.network,
+            "corridor": corridor,
+            "from": sender_id,
+            "to": receiver_id,
+            "amount": amount,
+            "platform_fee": fee,
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.ledger.append(tx)
+        return tx
+
+    def get_summary(self, user_id: str) -> dict:
+        """Return account balances and micro-savings progress."""
+        if user_id not in self.accounts:
+            raise KeyError(f"Account '{user_id}' not found.")
+        acct = self.accounts[user_id]
+        return {
+            "user_id": acct["user_id"],
+            "verified": acct["verified"],
+            "wallet_balance": acct["wallet_balance"],
+            "micro_savings_balance": acct["micro_savings_balance"],
+            "total_value": round(acct["wallet_balance"] + acct["micro_savings_balance"], 6),
+        }
+
+
+if __name__ == "__main__":
+    pulse = StellarPulseEngine(network="stellar-testnet", platform_fee_rate=0.0)
+
+    pulse.verify_digital_identity("arafat_user", "secret_key_01")
+    pulse.verify_digital_identity("receiver_user", "secret_key_02")
+
+    pulse.deposit_with_auto_micro_savings("arafat_user", amount=100.0, auto_save_ratio=0.15)
+    pulse.send_cross_border_transfer("arafat_user", "receiver_user", amount=25.0, corridor="BD-INTL")
+
+    print("Arafat Summary:", json.dumps(pulse.get_summary("arafat_user"), indent=2))
+    print("Receiver Summary:", json.dumps(pulse.get_summary("receiver_user"), indent=2))
+    print("Ledger Entries:", json.dumps(pulse.ledger, indent=2))
+
